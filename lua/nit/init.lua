@@ -7,18 +7,20 @@
 ---@class NitComment
 ---@field text string
 ---@field extmark_id? integer
----@field original_line? string
----@field original_lines? string[]
 ---@field range? NitRange
 
 ---@class NitState
 ---@field comments table<string, table<integer, NitComment>>
 ---@field initialized boolean
 
+---@class NitExportOpts
+---@field include_code? boolean Whether to include code snippets in export (default true)
+
 ---@class NitOpts
 ---@field picker? 'snacks'|'telescope'|'quickfix'|'auto'
 ---@field confirm_clear? boolean
 ---@field notify_wrap? boolean
+---@field export? NitExportOpts
 
 local M = {}
 
@@ -36,6 +38,9 @@ local config = {
   picker = 'auto',
   confirm_clear = true,
   notify_wrap = false,
+  export = {
+    include_code = true,
+  },
 }
 
 local HL = 'DiagnosticHint'
@@ -89,31 +94,41 @@ local function detect_picker()
   return 'quickfix'
 end
 
----@param bufnr integer
----@param lnum integer
----@return string
-local function get_line_content(bufnr, lnum)
-  local lines = vim.api.nvim_buf_get_lines(bufnr, lnum - 1, lnum, false)
-  return lines[1] or ''
-end
-
----@param bufnr integer
----@param start_lnum integer 1-indexed
----@param end_lnum integer 1-indexed (inclusive)
----@return string[]
-local function get_lines_content(bufnr, start_lnum, end_lnum)
-  local lines = vim.api.nvim_buf_get_lines(bufnr, start_lnum - 1, end_lnum, false)
-  local result = {}
-  for _, line in ipairs(lines) do
-    table.insert(result, vim.trim(line))
-  end
-  return result
-end
-
 ---@param file string
 ---@return boolean
 local function file_exists(file)
   return vim.fn.filereadable(file) == 1
+end
+
+---Read current line content from buffer or disk.
+---Returns lines for the given range, reading from the loaded buffer
+---if available, otherwise falling back to reading from disk.
+---Preserves original indentation for readable code snippets in export.
+---@param file string absolute file path
+---@param bufnr? integer loaded buffer number (or nil)
+---@param start_lnum integer 1-indexed start line
+---@param end_lnum integer 1-indexed end line (inclusive)
+---@return string[]? lines line contents, or nil if unreadable
+local function read_current_lines(file, bufnr, start_lnum, end_lnum)
+  if bufnr then
+    -- Read from loaded buffer (live content)
+    local lines = vim.api.nvim_buf_get_lines(bufnr, start_lnum - 1, end_lnum, false)
+    if lines and #lines > 0 then
+      return lines
+    end
+  end
+
+  -- Fallback: read from disk
+  if not file_exists(file) then return nil end
+  local disk_lines = vim.fn.readfile(file)
+  if not disk_lines or #disk_lines == 0 then return nil end
+
+  local result = {}
+  for i = start_lnum, math.min(end_lnum, #disk_lines) do
+    table.insert(result, disk_lines[i])
+  end
+  if #result == 0 then return nil end
+  return result
 end
 
 ---@param filepath string
@@ -607,15 +622,8 @@ function M.add(bufnr, lnum, text, range)
   local comment = {
     text = text,
     extmark_id = nil,
-    original_line = vim.trim(get_line_content(bufnr, lnum)),
     range = range,
   }
-
-  -- Capture all lines for range comments
-  if range and range.start ~= range.end_ then
-    comment.original_lines = get_lines_content(bufnr, range.start, range.end_)
-    comment.original_line = comment.original_lines[1] or ''
-  end
 
   local old = state.comments[file][lnum]
   if old and old.extmark_id then
@@ -895,6 +903,7 @@ function M.export()
     notify(string.format('Warning: %d file(s) no longer exist', count), vim.log.levels.WARN)
   end
 
+  local include_code = config.export.include_code
   local lines = {
     'I reviewed your code and have the following comments. Please address them.',
     '',
@@ -903,27 +912,40 @@ function M.export()
   for i, item in ipairs(items) do
     local filepath = vim.fn.fnamemodify(item.file, ':~:.')
     local lang = get_language(item.file)
-
-    -- Header
-    table.insert(lines, string.format('%d. [nit] %s', i, filepath))
-    table.insert(lines, '')
-
-    -- Code block with context
     local has_range = item.range_end ~= nil
 
-    if has_range and item.comment.original_lines and #item.comment.original_lines > 0 then
-      -- Range comment: show all lines
-      table.insert(lines, string.format('```%s %s:%d-%d', lang, filepath, item.lnum, item.range_end))
-      for _, orig_line in ipairs(item.comment.original_lines) do
-        table.insert(lines, orig_line)
-      end
-      table.insert(lines, '```')
+    if include_code then
+      -- Header (file path only, line info goes in code fence)
+      table.insert(lines, string.format('%d. [nit] %s', i, filepath))
       table.insert(lines, '')
-    elseif item.comment.original_line and item.comment.original_line ~= '' then
-      -- Single-line comment
-      table.insert(lines, string.format('```%s %s:%d', lang, filepath, item.lnum))
-      table.insert(lines, item.comment.original_line)
-      table.insert(lines, '```')
+
+      -- Code block with live content from buffer or disk
+      if item.exists then
+        local bufnr = get_bufnr_for_file(item.file)
+        local start_lnum = item.lnum
+        local end_lnum = item.range_end or item.lnum
+        local current_lines = read_current_lines(item.file, bufnr, start_lnum, end_lnum)
+
+        if current_lines and #current_lines > 0 then
+          if has_range then
+            table.insert(lines, string.format('```%s %s:%d-%d', lang, filepath, start_lnum, end_lnum))
+          else
+            table.insert(lines, string.format('```%s %s:%d', lang, filepath, start_lnum))
+          end
+          for _, line in ipairs(current_lines) do
+            table.insert(lines, line)
+          end
+          table.insert(lines, '```')
+          table.insert(lines, '')
+        end
+      end
+    else
+      -- No code snippets: header includes file path and line indicator
+      if has_range then
+        table.insert(lines, string.format('%d. [nit] `%s:%d-%d`', i, filepath, item.lnum, item.range_end))
+      else
+        table.insert(lines, string.format('%d. [nit] `%s:%d`', i, filepath, item.lnum))
+      end
       table.insert(lines, '')
     end
 
@@ -1040,7 +1062,14 @@ function M.setup(opts)
     picker = { opts.picker, 'string', true },
     confirm_clear = { opts.confirm_clear, 'boolean', true },
     notify_wrap = { opts.notify_wrap, 'boolean', true },
+    export = { opts.export, 'table', true },
   })
+
+  if opts.export then
+    vim.validate({
+      include_code = { opts.export.include_code, 'boolean', true },
+    })
+  end
 
   config = vim.tbl_deep_extend('force', config, opts)
 

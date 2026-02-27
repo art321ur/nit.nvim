@@ -26,6 +26,7 @@ A minimal Neovim plugin for annotating code with review comments. Designed for A
 - **In-memory only**: No persistence across sessions. Review sessions are ephemeral.
 - **Extmarks for rendering**: Comments follow line movements automatically
 - **Extmark position syncing**: Before operations, sync extmark positions back to state to handle line insertions/deletions
+- **Live code in export**: Export reads current buffer/file content (not stale snapshots from comment creation time)
 - **Picker fallback**: Snacks → Telescope → Quickfix
 - **Buffer validation**: Only works on normal file buffers, not special buffers
 
@@ -88,6 +89,12 @@ Note: Keymaps are user-configured. See README.md for recommended setup.
 - Verify extmark tracking with line insertions/deletions
 - Test edge cases: deleted files, comments beyond EOF, special buffers
 
+### Configuration
+
+- Config uses `NitOpts` type with nested `NitExportOpts` for export settings
+- `export.include_code` (default `true`): when true, export includes code fences with live content; when false, only file:line references
+- All options validated in `M.setup()` with `vim.validate()`
+
 ## Commit Messages
 
 Use short, single-line conventional commits:
@@ -127,3 +134,5 @@ Common types: `feat`, `fix`, `docs`, `refactor`, `test`, `chore`
 - Delete range comment from middle of range, verify it gets removed
 - Edit existing range comment from any line within it
 - Add lines within a range, verify range offsets stay consistent
+- Export after editing annotated code, verify export shows current (not stale) content
+- Export with `export.include_code = false`, verify no code fences in output
