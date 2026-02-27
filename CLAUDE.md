@@ -44,7 +44,7 @@ nit.nvim/
 
 - `vim.api.nvim_buf_set_extmark()` with `virt_lines`, `invalidate`
 - `vim.api.nvim_buf_get_extmark_by_id()` to read current position
-- `vim.api.nvim_create_autocmd()` with augroup for BufWinEnter
+- `vim.api.nvim_create_autocmd()` with augroup for BufWinEnter, BufLeave, BufWritePost, WinLeave, VimLeavePre
 - `vim.ui.select()` for confirmation dialogs
 - `vim.fn.setreg('+', ...)` for clipboard
 
