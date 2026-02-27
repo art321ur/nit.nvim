@@ -322,6 +322,16 @@ local function sync_extmark_positions(file)
   state.comments[file] = updated
 end
 
+---Sync extmark positions for a single buffer (used by autocmds)
+---@param bufnr integer
+local function sync_buf_extmarks(bufnr)
+  if not is_valid_buf(bufnr) then return end
+  local file = normalize_path(vim.api.nvim_buf_get_name(bufnr))
+  if file ~= '' then
+    sync_extmark_positions(file)
+  end
+end
+
 -- Picker implementations
 
 ---@param items table[]
@@ -880,6 +890,28 @@ function M.setup(opts)
     group = augroup,
     callback = function(ev)
       restore_comments(ev.buf)
+    end,
+  })
+
+  -- Sync extmark positions back to state when leaving buffers/windows
+  -- This ensures line numbers stay correct after edits, including autoformat
+  vim.api.nvim_create_autocmd({ 'BufLeave', 'BufWritePost', 'WinLeave' }, {
+    group = augroup,
+    callback = function(ev)
+      sync_buf_extmarks(ev.buf)
+    end,
+  })
+
+  -- Sync all files before Neovim exits
+  vim.api.nvim_create_autocmd('VimLeavePre', {
+    group = augroup,
+    callback = function()
+      for file, _ in pairs(state.comments) do
+        local bufnr = get_bufnr_for_file(file)
+        if bufnr then
+          sync_buf_extmarks(bufnr)
+        end
+      end
     end,
   })
 
