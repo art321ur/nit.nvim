@@ -17,9 +17,12 @@ nit.nvim is a Neovim plugin for leaving review comments in code and
 exporting them as structured feedback for AI agents.
 
 Features:~
-  • Comments with [nit] prefix
+  • Comments with [nit] prefix rendered as virtual text
+  • Range comments via visual selection with highlighted line ranges
   • Comments follow line movements via extmarks
   • Export all comments as LLM-optimized markdown
+  • Export uses live buffer content (not stale snapshots)
+  • Configurable code snippets in export (`include_code` option)
   • Navigate between comments
   • Works with Snacks, Telescope, or quickfix pickers
 
@@ -35,18 +38,29 @@ INSTALLATION                                                *nit-installation*
 
 Using lazy.nvim: >lua
     {
-      'yourusername/nit.nvim',
+      'tobias-walle/nit.nvim',
       config = function()
         require('nit').setup()
       end,
+      cmd = { 'NitAdd', 'NitDelete', 'NitList', 'NitExport',
+              'NitClear', 'NitNext', 'NitPrev' },
       keys = {
-        { '<leader>na', '<cmd>NitAdd<cr>', desc = '[nit] Add/edit' },
-        { '<leader>nd', '<cmd>NitDelete<cr>', desc = '[nit] Delete' },
-        { '<leader>nl', '<cmd>NitList<cr>', desc = '[nit] List' },
-        { '<leader>ne', '<cmd>NitExport<cr>', desc = '[nit] Export' },
-        { '<leader>nx', '<cmd>NitClear<cr>', desc = '[nit] Clear all' },
-        { ']n', '<cmd>NitNext<cr>', desc = '[nit] Next' },
-        { '[n', '<cmd>NitPrev<cr>', desc = '[nit] Prev' },
+        { '<leader>na', function() require('nit').input() end,
+          desc = '[nit] Add/edit' },
+        { '<leader>na', ":'<,'>NitAdd<CR>", mode = 'v',
+          desc = '[nit] Add/edit (range)' },
+        { '<leader>nd', function() require('nit').delete() end,
+          desc = '[nit] Delete' },
+        { '<leader>nl', function() require('nit').list() end,
+          desc = '[nit] List' },
+        { '<leader>ne', function() require('nit').export() end,
+          desc = '[nit] Export' },
+        { '<leader>nx', function() require('nit').clear() end,
+          desc = '[nit] Clear all' },
+        { ']n', function() require('nit').next() end,
+          desc = '[nit] Next' },
+        { '[n', function() require('nit').prev() end,
+          desc = '[nit] Prev' },
       },
     }
 <
@@ -56,15 +70,23 @@ COMMANDS                                                        *nit-commands*
 
 :NitAdd                                                             *:NitAdd*
     Open input window to add or edit a comment at the cursor position.
+    Supports visual selection: select a range of lines in visual mode, then
+    run `:NitAdd` (or use the visual mode keymap) to create a range comment.
+
+    Single-line visual selection is treated as a single-line comment (no
+    range). Range comments highlight the annotated lines with a subtle
+    background using the `NitRange` highlight group.
 
     In the input window (starts in insert mode):
       - Esc (insert mode): Switch to normal mode
       - Enter (normal mode): Submit comment
+      - Ctrl+Enter (insert mode): Submit comment
       - Esc or q (normal mode): Cancel
       - Empty submit: Delete existing comment
 
 :NitDelete                                                       *:NitDelete*
-    Delete the comment at the cursor position.
+    Delete the comment at the cursor position. If the cursor is anywhere
+    within a range comment, that range comment is deleted.
 
 :NitList                                                           *:NitList*
     Open a picker to list and navigate all comments. The picker used depends
@@ -101,23 +123,34 @@ require('nit').setup({opts})                                    *nit.setup()*
           picker = 'telescope',
           confirm_clear = true,
           notify_wrap = false,
+          export = {
+            include_code = true,
+          },
         })
 <
 
-require('nit').add({bufnr}, {lnum}, {text})                       *nit.add()*
+require('nit').add({bufnr}, {lnum}, {text}, {range})              *nit.add()*
     Add a comment programmatically.
 
     Parameters: ~
         {bufnr} (number|nil) Buffer number (default: current buffer)
-        {lnum}  (number|nil) Line number (default: cursor line)
+        {lnum}  (number|nil) Line number, 1-indexed (default: cursor line)
         {text}  (string) Comment text
+        {range} (table|nil) Optional range: `{ start = N, end_ = M }`
+                            where N and M are 1-indexed inclusive line numbers.
+                            Omit for single-line comments.
 
     Example: >lua
+        -- Single-line comment
         require('nit').add(nil, nil, 'This needs refactoring')
+
+        -- Range comment on lines 10-15
+        require('nit').add(nil, 10, 'Extract this block', { start = 10, end_ = 15 })
 <
 
 require('nit').delete()                                         *nit.delete()*
-    Delete the comment at the cursor position.
+    Delete the comment at the cursor position. If the cursor is within a
+    range comment, deletes that range comment.
 
 require('nit').get_comments({file})                      *nit.get_comments()*
     Get all comments for a file or all files.
@@ -200,18 +233,36 @@ Pass a table to |nit.setup()| with these optional fields:
     notify_wrap     boolean   Show notification when navigation wraps around
                               (default: false)
 
+    export          table     Export options (see below)
+
+Export options:~
+
+    export.include_code  boolean  Include code snippets in export output.
+                                  When true (default), each comment includes
+                                  a fenced code block with live content from
+                                  the buffer or disk. When false, only a
+                                  `file:line` reference is included.
+                                  (default: true)
+
 Example: >lua
     require('nit').setup({
       picker = 'telescope',
       confirm_clear = true,
       notify_wrap = false,
+      export = {
+        include_code = true,
+      },
     })
 <
 
 ==============================================================================
 EXPORT FORMAT                                              *nit-export-format*
 
-Comments are exported as markdown optimized for LLM consumption:
+Comments are exported as markdown optimized for LLM consumption. The
+export reads live buffer content at export time (not stale snapshots from
+when the comment was created).
+
+With `include_code = true` (default):~
 >
     I reviewed your code and have the following comments. Please address them.
 
@@ -221,20 +272,40 @@ Comments are exported as markdown optimized for LLM consumption:
     if attempts > 5 then
     ```
 
-    _Comment_: Magic number should be constant
+    _Comment_: Magic number should be a constant
 
-    2. [nit] src/init.lua
+    2. [nit] src/auth.lua
 
-    ```lua src/init.lua:8
-    local M = {}
+    ```lua src/auth.lua:87-92
+    local function process_request()
+      validate_input()
+      check_permissions()
+      execute_action()
+      log_result()
+    end
     ```
 
-    _Comment_: This pattern is used throughout
+    _Comment_: This pattern appears in multiple places
+<
+
+With `include_code = false`:~
+>
+    I reviewed your code and have the following comments. Please address them.
+
+    1. [nit] `src/auth.lua:42`
+
+    _Comment_: Magic number should be a constant
+
+    2. [nit] `src/auth.lua:87-92`
+
+    _Comment_: This pattern appears in multiple places
 <
 
 Each comment includes:
   • Numbered list with file path
-  • Code block with syntax highlighting and line number
+  • Code block with syntax highlighting and line reference
+    (when `include_code = true`)
+  • Inline file:line reference (when `include_code = false`)
   • Comment text
   • Warning for deleted files (if applicable)
 

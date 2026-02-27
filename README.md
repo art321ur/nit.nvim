@@ -3,8 +3,10 @@
 A Neovim plugin for leaving review comments in code and exporting them as structured feedback for AI agents.
 
 - Comments rendered as virtual text with `[nit]` prefix
+- Range comments via visual selection with highlighted line ranges
 - Comments follow line movements automatically via extmarks
 - Export all comments as LLM-optimized markdown in one shot
+- Export uses live buffer content (not stale snapshots from comment time)
 - Navigate between comments with `:NitNext` / `:NitPrev`
 - Works with Snacks, Telescope, or quickfix pickers
 
@@ -27,6 +29,7 @@ A Neovim plugin for leaving review comments in code and exporting them as struct
   end,
   keys = {
     { '<leader>na', function() require('nit').input() end, desc = '[nit] Add/edit' },
+    { '<leader>na', ":'<,'>NitAdd<CR>", mode = 'v', desc = '[nit] Add/edit (range)' },
     { '<leader>nd', function() require('nit').delete() end, desc = '[nit] Delete' },
     { '<leader>nl', function() require('nit').list() end, desc = '[nit] List' },
     { '<leader>ne', function() require('nit').export() end, desc = '[nit] Export' },
@@ -60,6 +63,9 @@ require('nit').setup({
   picker = 'auto',       -- 'snacks' | 'telescope' | 'quickfix' | 'auto'
   confirm_clear = true,  -- Ask before clearing all comments
   notify_wrap = false,   -- Notify when navigation wraps around
+  export = {
+    include_code = true,   -- Include code snippets in export (default true)
+  },
 })
 ```
 
@@ -89,16 +95,36 @@ _Comment_: Magic number should be a constant
 
 2. [nit] src/auth.lua
 
-```lua src/auth.lua:87
+```lua src/auth.lua:87-92
 local function process_request()
+  validate_input()
+  check_permissions()
+  execute_action()
+  log_result()
+end
 ```
 
-_Comment_: This pattern appears in multiple places
+_Comment_: This pattern appears in multiple places, extract to shared helper
+```
+
+With `export.include_code = false`, code fences are omitted:
+
+```markdown
+I reviewed your code and have the following comments. Please address them.
+
+1. [nit] `src/auth.lua:42`
+
+_Comment_: Magic number should be a constant
+
+2. [nit] `src/auth.lua:87-92`
+
+_Comment_: This pattern appears in multiple places, extract to shared helper
 ```
 
 Each comment includes:
 - Numbered list with file path
-- Code block with syntax highlighting and line number
+- Code block with syntax highlighting and line reference (when `include_code = true`)
+- Inline file:line reference (when `include_code = false`)
 - Your comment text
 - Warning for deleted files (if applicable)
 
