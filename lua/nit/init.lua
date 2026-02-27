@@ -1,9 +1,15 @@
 -- lua/nit/init.lua
 
+---@class NitRange
+---@field start integer 1-indexed start line
+---@field end_ integer 1-indexed end line (inclusive)
+
 ---@class NitComment
 ---@field text string
 ---@field extmark_id? integer
 ---@field original_line? string
+---@field original_lines? string[]
+---@field range? NitRange
 
 ---@class NitState
 ---@field comments table<string, table<integer, NitComment>>
@@ -91,6 +97,19 @@ local function get_line_content(bufnr, lnum)
   return lines[1] or ''
 end
 
+---@param bufnr integer
+---@param start_lnum integer 1-indexed
+---@param end_lnum integer 1-indexed (inclusive)
+---@return string[]
+local function get_lines_content(bufnr, start_lnum, end_lnum)
+  local lines = vim.api.nvim_buf_get_lines(bufnr, start_lnum - 1, end_lnum, false)
+  local result = {}
+  for _, line in ipairs(lines) do
+    table.insert(result, vim.trim(line))
+  end
+  return result
+end
+
 ---@param file string
 ---@return boolean
 local function file_exists(file)
@@ -148,6 +167,26 @@ local function get_extmark_lnum(bufnr, extmark_id)
   return nil
 end
 
+---Get the start and optional end line of an extmark (1-indexed).
+---For range extmarks, returns both start_lnum and end_lnum.
+---@param bufnr integer
+---@param extmark_id integer
+---@return integer? start_lnum 1-indexed start line
+---@return integer? end_lnum 1-indexed end line (nil for single-line)
+local function get_extmark_range(bufnr, extmark_id)
+  local mark = vim.api.nvim_buf_get_extmark_by_id(bufnr, ns, extmark_id, { details = true })
+  if not mark or #mark < 3 then return nil, nil end
+
+  local start_lnum = mark[1] + 1
+  local details = mark[3]
+
+  if details and details.end_row then
+    return start_lnum, details.end_row + 1
+  end
+
+  return start_lnum, nil
+end
+
 ---@param file string
 ---@return integer? bufnr
 local function get_bufnr_for_file(file)
@@ -158,28 +197,87 @@ local function get_bufnr_for_file(file)
   return nil
 end
 
+---Find a comment at the given cursor line, checking both exact match and range membership.
+---State key is now the start line. For range comments, the end comes from the extmark's end_row.
+---@param file string normalized file path
+---@param bufnr integer
+---@param cursor_lnum integer 1-indexed cursor line
+---@return integer? stored_lnum the key in state.comments[file], or nil
+---@return NitComment? comment
+local function find_comment_at(file, bufnr, cursor_lnum)
+  local comments = state.comments[file]
+  if not comments then return nil, nil end
+
+  for lnum, comment in pairs(comments) do
+    if comment.extmark_id then
+      local start_lnum, end_lnum = get_extmark_range(bufnr, comment.extmark_id)
+      if start_lnum then
+        -- Exact match on start line (works for both single-line and range)
+        if start_lnum == cursor_lnum then
+          return lnum, comment
+        end
+
+        -- Range match: cursor is within the range
+        if end_lnum and cursor_lnum > start_lnum and cursor_lnum <= end_lnum then
+          return lnum, comment
+        end
+      end
+    else
+      -- No extmark, fall back to stored key
+      if lnum == cursor_lnum then
+        return lnum, comment
+      end
+      if comment.range and cursor_lnum >= comment.range.start and cursor_lnum <= comment.range.end_ then
+        return lnum, comment
+      end
+    end
+  end
+
+  return nil, nil
+end
+
 -- Core functions
 
+---Render a comment as an extmark. For range comments, the extmark is placed at the
+---start line with end_row pointing to the end line. Virtual text renders above the
+---start line. Range highlighting uses NitRange hl_group.
 ---@param bufnr integer
----@param lnum integer
+---@param lnum integer 1-indexed start line (state key)
 ---@param comment NitComment
 ---@return integer extmark_id
 local function render(bufnr, lnum, comment)
+  -- Clean up old extmark
   if comment.extmark_id then
     pcall(vim.api.nvim_buf_del_extmark, bufnr, ns, comment.extmark_id)
   end
 
-  local extmark_id = vim.api.nvim_buf_set_extmark(bufnr, ns, lnum - 1, 0, {
+  local is_range = comment.range and comment.range.start ~= comment.range.end_
+
+  local extmark_opts = {
     virt_lines = {
       {
         { '┃ ', HL },
         { string.format('[nit] %s', comment.text), 'Comment' },
       },
     },
-    virt_lines_above = false,
+    virt_lines_above = true,
     invalidate = true,
-    right_gravity = true,
-  })
+  }
+
+  if is_range then
+    -- Range comment: single extmark at start with end_row at end
+    extmark_opts.end_row = comment.range.end_ - 1  -- 0-indexed
+    extmark_opts.end_col = 0
+    extmark_opts.hl_group = 'NitRange'
+    extmark_opts.hl_eol = true
+    extmark_opts.right_gravity = false
+    extmark_opts.end_right_gravity = true
+  else
+    -- Single-line comment: default gravity (right_gravity=true)
+    extmark_opts.right_gravity = true
+  end
+
+  local extmark_id = vim.api.nvim_buf_set_extmark(bufnr, ns, lnum - 1, 0, extmark_opts)
 
   return extmark_id
 end
@@ -243,7 +341,7 @@ local function get_sorted_comments(file, use_extmarks)
   return result
 end
 
----@return {file: string, lnum: integer, comment: NitComment, exists: boolean}[]
+---@return {file: string, lnum: integer, range_end: integer?, comment: NitComment, exists: boolean}[]
 local function collect_comments()
   local items = {}
 
@@ -253,17 +351,30 @@ local function collect_comments()
 
     for stored_lnum, comment in pairs(comments) do
       local lnum = stored_lnum
+      local range_end = nil
 
       if bufnr and comment.extmark_id then
-        local extmark_lnum = get_extmark_lnum(bufnr, comment.extmark_id)
-        if extmark_lnum then
-          lnum = extmark_lnum
+        local start_lnum, end_lnum = get_extmark_range(bufnr, comment.extmark_id)
+        if start_lnum then
+          lnum = start_lnum
+          range_end = end_lnum
         end
+      end
+
+      -- Fallback to stored range if extmark didn't provide end
+      if not range_end and comment.range then
+        range_end = comment.range.end_
+      end
+
+      -- Don't report range_end if same as lnum (single-line)
+      if range_end and range_end == lnum then
+        range_end = nil
       end
 
       table.insert(items, {
         file = file,
         lnum = lnum,
+        range_end = range_end,
         comment = comment,
         exists = exists,
       })
@@ -293,9 +404,14 @@ local function sync_extmark_positions(file)
     local lnum = stored_lnum
 
     if comment.extmark_id then
-      local extmark_lnum = get_extmark_lnum(bufnr, comment.extmark_id)
-      if extmark_lnum then
-        lnum = extmark_lnum
+      local start_lnum, end_lnum = get_extmark_range(bufnr, comment.extmark_id)
+      if start_lnum then
+        lnum = start_lnum
+        -- Update range from extmark-tracked positions
+        if comment.range and end_lnum then
+          comment.range.start = start_lnum
+          comment.range.end_ = end_lnum
+        end
       end
     end
 
@@ -334,16 +450,35 @@ end
 
 -- Picker implementations
 
+---Format the nit label for display in pickers
+---@param comment NitComment
+---@return string
+local function format_nit_label(comment)
+  return string.format('[nit] %s', comment.text)
+end
+
+---Format the line indicator for pickers (e.g., "42" or "10-15")
+---@param item table collected comment item
+---@return string
+local function format_line_indicator(item)
+  if item.range_end then
+    return string.format('%d-%d', item.lnum, item.range_end)
+  end
+  return tostring(item.lnum)
+end
+
 ---@param items table[]
 local function list_snacks(items)
   local snacks = require('snacks')
 
   local picker_items = vim.tbl_map(function(item)
     local prefix = item.exists and '' or '[DELETED] '
+    local label = format_nit_label(item.comment)
     return {
-      text = string.format('%s[nit] %s', prefix, item.comment.text),
+      text = string.format('%s%s', prefix, label),
       file = item.file,
       pos = { item.lnum, 0 },
+      line_indicator = format_line_indicator(item),
       exists = item.exists,
     }
   end, items)
@@ -353,7 +488,7 @@ local function list_snacks(items)
     format = function(item)
       if not item then return {} end
       local short = vim.fn.fnamemodify(item.file, ':~:.')
-      local formatted = string.format('%s:%d %s', short, item.pos[1], item.text)
+      local formatted = string.format('%s:%s %s', short, item.line_indicator, item.text)
       return { { formatted } }
     end,
     actions = {
@@ -387,7 +522,9 @@ local function list_telescope(items)
       entry_maker = function(item)
         local short = vim.fn.fnamemodify(item.file, ':~:.')
         local prefix = item.exists and '' or '[DELETED] '
-        local display = string.format('%s%s:%d [nit] %s', prefix, short, item.lnum, item.comment.text)
+        local label = format_nit_label(item.comment)
+        local line_ind = format_line_indicator(item)
+        local display = string.format('%s%s:%s %s', prefix, short, line_ind, label)
         return {
           value = item,
           display = display,
@@ -422,11 +559,12 @@ end
 local function list_quickfix(items)
   local qf_items = vim.tbl_map(function(item)
     local prefix = item.exists and '' or '[DELETED] '
+    local label = format_nit_label(item.comment)
     return {
       filename = item.file,
       lnum = item.lnum,
       col = 1,
-      text = string.format('%s[nit] %s', prefix, item.comment.text),
+      text = string.format('%s%s', prefix, label),
       type = 'N',
       valid = item.exists,
     }
@@ -443,9 +581,10 @@ end
 -- Public API
 
 ---@param bufnr? integer
----@param lnum? integer
+---@param lnum? integer 1-indexed start line (state key)
 ---@param text string
-function M.add(bufnr, lnum, text)
+---@param range? NitRange
+function M.add(bufnr, lnum, text, range)
   bufnr = bufnr or vim.api.nvim_get_current_buf()
   if not is_valid_buf(bufnr) then
     notify('Cannot add comment to this buffer type', vim.log.levels.WARN)
@@ -469,11 +608,18 @@ function M.add(bufnr, lnum, text)
     text = text,
     extmark_id = nil,
     original_line = vim.trim(get_line_content(bufnr, lnum)),
+    range = range,
   }
+
+  -- Capture all lines for range comments
+  if range and range.start ~= range.end_ then
+    comment.original_lines = get_lines_content(bufnr, range.start, range.end_)
+    comment.original_line = comment.original_lines[1] or ''
+  end
 
   local old = state.comments[file][lnum]
   if old and old.extmark_id then
-    comment.extmark_id = old.extmark_id
+    pcall(vim.api.nvim_buf_del_extmark, bufnr, ns, old.extmark_id)
   end
 
   comment.extmark_id = render(bufnr, lnum, comment)
@@ -486,38 +632,18 @@ function M.delete()
 
   sync_extmark_positions(file)
 
-  local comments = state.comments[file]
-  if not comments then
+  local found_lnum, comment = find_comment_at(file, bufnr, cursor_lnum)
+
+  if not found_lnum or not comment then
     notify('No comment at cursor', vim.log.levels.WARN)
     return
   end
 
-  local found_lnum = nil
-  for lnum, comment in pairs(comments) do
-    local actual_lnum = lnum
-    if comment.extmark_id then
-      local extmark_lnum = get_extmark_lnum(bufnr, comment.extmark_id)
-      if extmark_lnum then
-        actual_lnum = extmark_lnum
-      end
-    end
-    if actual_lnum == cursor_lnum then
-      found_lnum = lnum
-      break
-    end
-  end
-
-  if not found_lnum then
-    notify('No comment at cursor', vim.log.levels.WARN)
-    return
-  end
-
-  local comment = comments[found_lnum]
   if comment.extmark_id then
     pcall(vim.api.nvim_buf_del_extmark, bufnr, ns, comment.extmark_id)
   end
 
-  comments[found_lnum] = nil
+  state.comments[file][found_lnum] = nil
   notify('Deleted comment')
 end
 
@@ -571,38 +697,55 @@ function M.prev()
   end
 end
 
-function M.input()
+---@param opts? {line1?: integer, line2?: integer}
+function M.input(opts)
+  opts = opts or {}
   local target_buf = vim.api.nvim_get_current_buf()
   if not is_valid_buf(target_buf) then
     notify('Cannot add comment to this buffer type', vim.log.levels.WARN)
     return
   end
 
-  local file, target_lnum = get_cursor_context(target_buf)
+  local file = normalize_path(vim.api.nvim_buf_get_name(target_buf))
   if file == '' then
     notify('Cannot add comment to unnamed buffer', vim.log.levels.WARN)
     return
   end
 
+  local line1 = opts.line1
+  local line2 = opts.line2
+
+  -- Default to cursor line if no range provided
+  if not line1 then
+    line1 = vim.api.nvim_win_get_cursor(0)[1]
+    line2 = line1
+  end
+
+  -- Clamp to buffer bounds
+  local line_count = vim.api.nvim_buf_line_count(target_buf)
+  line1 = math.max(1, math.min(line1, line_count))
+  line2 = math.max(1, math.min(line2, line_count))
+
+  -- Ensure line1 <= line2
+  if line1 > line2 then
+    line1, line2 = line2, line1
+  end
+
+  local is_range = line1 ~= line2
+  ---@type NitRange?
+  local range = is_range and { start = line1, end_ = line2 } or nil
+
+  -- The extmark/key line is the start of the range (or the single line)
+  local target_lnum = line1
+
   sync_extmark_positions(file)
 
-  local existing = nil
-  local existing_lnum = nil
-  if state.comments[file] then
-    for lnum, comment in pairs(state.comments[file]) do
-      local actual_lnum = lnum
-      if comment.extmark_id then
-        local extmark_lnum = get_extmark_lnum(target_buf, comment.extmark_id)
-        if extmark_lnum then
-          actual_lnum = extmark_lnum
-        end
-      end
-      if actual_lnum == target_lnum then
-        existing = comment
-        existing_lnum = lnum
-        break
-      end
-    end
+  -- Look for existing comment: first check exact match at target_lnum, then range membership
+  local existing_lnum, existing = find_comment_at(file, target_buf, target_lnum)
+
+  -- If no range was explicitly given (single-line invocation), also check if cursor is inside a range comment
+  if not existing and not is_range then
+    existing_lnum, existing = find_comment_at(file, target_buf, line1)
   end
 
   local prefill = ''
@@ -618,6 +761,13 @@ function M.input()
   local width = math.min(70, vim.o.columns - 4)
   local height = 5
 
+  local title
+  if is_range then
+    title = string.format(' [nit L%d-%d] ', line1, line2)
+  else
+    title = ' [nit] '
+  end
+
   local win = vim.api.nvim_open_win(buf, true, {
     relative = 'cursor',
     row = 1,
@@ -626,7 +776,7 @@ function M.input()
     height = height,
     style = 'minimal',
     border = 'rounded',
-    title = ' [nit] ',
+    title = title,
     title_pos = 'center',
     footer = ' Enter: submit | Esc/q: cancel ',
     footer_pos = 'center',
@@ -683,7 +833,7 @@ function M.input()
       state.comments[file][existing_lnum] = nil
     end
 
-    M.add(target_buf, target_lnum, text)
+    M.add(target_buf, target_lnum, text, range)
     notify(existing and 'Updated comment' or 'Added comment')
   end
 
@@ -759,7 +909,18 @@ function M.export()
     table.insert(lines, '')
 
     -- Code block with context
-    if item.comment.original_line and item.comment.original_line ~= '' then
+    local has_range = item.range_end ~= nil
+
+    if has_range and item.comment.original_lines and #item.comment.original_lines > 0 then
+      -- Range comment: show all lines
+      table.insert(lines, string.format('```%s %s:%d-%d', lang, filepath, item.lnum, item.range_end))
+      for _, orig_line in ipairs(item.comment.original_lines) do
+        table.insert(lines, orig_line)
+      end
+      table.insert(lines, '```')
+      table.insert(lines, '')
+    elseif item.comment.original_line and item.comment.original_line ~= '' then
+      -- Single-line comment
       table.insert(lines, string.format('```%s %s:%d', lang, filepath, item.lnum))
       table.insert(lines, item.comment.original_line)
       table.insert(lines, '```')
@@ -883,6 +1044,9 @@ function M.setup(opts)
 
   config = vim.tbl_deep_extend('force', config, opts)
 
+  -- Define highlight group for range comments (subtle background)
+  vim.api.nvim_set_hl(0, 'NitRange', { default = true, link = 'CursorLine' })
+
   -- Create augroup
   augroup = vim.api.nvim_create_augroup('nit', { clear = true })
 
@@ -916,7 +1080,6 @@ function M.setup(opts)
   })
 
   local commands = {
-    NitAdd = { fn = M.input, desc = 'Add or edit comment' },
     NitDelete = { fn = M.delete, desc = 'Delete comment at cursor' },
     NitList = { fn = M.list, desc = 'List all comments' },
     NitExport = { fn = M.export, desc = 'Export comments to clipboard' },
@@ -928,6 +1091,17 @@ function M.setup(opts)
   for name, cmd in pairs(commands) do
     vim.api.nvim_create_user_command(name, cmd.fn, { desc = cmd.desc })
   end
+
+  -- NitAdd supports range for visual selection and command ranges
+  vim.api.nvim_create_user_command('NitAdd', function(cmd_opts)
+    local input_opts = {}
+    -- Only pass range if explicitly given (visual selection or :10,15NitAdd)
+    if cmd_opts.range > 0 then
+      input_opts.line1 = cmd_opts.line1
+      input_opts.line2 = cmd_opts.line2
+    end
+    M.input(input_opts)
+  end, { desc = 'Add or edit comment', range = true })
 
   state.initialized = true
 end
