@@ -6,7 +6,7 @@
 
 ---@class NitComment
 ---@field text string
----@field extmark_id? integer
+---@field extmarks table<integer, integer>
 ---@field range? NitRange
 
 ---@class NitState
@@ -54,6 +54,7 @@ local function is_valid_buf(bufnr)
     return false
   end
   local bt = vim.bo[bufnr].buftype
+  if vim.b[bufnr].snacks_meta then return true end
   return bt == '' or bt == 'acwrite'
 end
 
@@ -216,7 +217,7 @@ end
 ---State key is now the start line. For range comments, the end comes from the extmark's end_row.
 ---@param file string normalized file path
 ---@param bufnr integer
----@param cursor_lnum integer 1-indexed cursor line
+---@param cursor_lnum integer 1-indexed cursor line in bufnr
 ---@return integer? stored_lnum the key in state.comments[file], or nil
 ---@return NitComment? comment
 local function find_comment_at(file, bufnr, cursor_lnum)
@@ -224,8 +225,8 @@ local function find_comment_at(file, bufnr, cursor_lnum)
   if not comments then return nil, nil end
 
   for lnum, comment in pairs(comments) do
-    if comment.extmark_id then
-      local start_lnum, end_lnum = get_extmark_range(bufnr, comment.extmark_id)
+    if comment.extmarks and comment.extmarks[bufnr] then
+      local start_lnum, end_lnum = get_extmark_range(bufnr, comment.extmarks[bufnr])
       if start_lnum then
         -- Exact match on start line (works for both single-line and range)
         if start_lnum == cursor_lnum then
@@ -238,12 +239,15 @@ local function find_comment_at(file, bufnr, cursor_lnum)
         end
       end
     else
-      -- No extmark, fall back to stored key
-      if lnum == cursor_lnum then
-        return lnum, comment
-      end
-      if comment.range and cursor_lnum >= comment.range.start and cursor_lnum <= comment.range.end_ then
-        return lnum, comment
+      -- If no extmark for this buffer, we need to compare using real lines
+      local _, real_cursor = get_cursor_context(bufnr, cursor_lnum)
+      if real_cursor then
+        if lnum == real_cursor then
+          return lnum, comment
+        end
+        if comment.range and real_cursor >= comment.range.start and real_cursor <= comment.range.end_ then
+          return lnum, comment
+        end
       end
     end
   end
@@ -253,20 +257,49 @@ end
 
 -- Core functions
 
+---@param bufnr integer
+---@param file string
+---@param real_lnum integer
+---@return integer? render_lnum
+local function get_render_lnum(bufnr, file, real_lnum)
+  local bufname = vim.api.nvim_buf_get_name(bufnr)
+  if bufname:match("^codediff://") then
+    return real_lnum
+  end
+  if vim.b[bufnr].snacks_meta then
+    for l, m in pairs(vim.b[bufnr].snacks_meta) do
+      if type(m) == 'table' and m.diff and normalize_path(m.diff.file) == file and m.diff.line == real_lnum then
+        return l
+      end
+    end
+    return nil
+  end
+  return real_lnum
+end
+
 ---Render a comment as an extmark. For range comments, the extmark is placed at the
 ---start line with end_row pointing to the end line. Virtual text renders above the
 ---start line. Range highlighting uses NitRange hl_group.
 ---@param bufnr integer
+---@param file string
 ---@param lnum integer 1-indexed start line (state key)
 ---@param comment NitComment
----@return integer extmark_id
-local function render(bufnr, lnum, comment)
+---@return integer? extmark_id
+local function render(bufnr, file, lnum, comment)
+  comment.extmarks = comment.extmarks or {}
   -- Clean up old extmark
-  if comment.extmark_id then
-    pcall(vim.api.nvim_buf_del_extmark, bufnr, ns, comment.extmark_id)
+  if comment.extmarks[bufnr] then
+    pcall(vim.api.nvim_buf_del_extmark, bufnr, ns, comment.extmarks[bufnr])
   end
 
+  local render_start = get_render_lnum(bufnr, file, lnum)
+  if not render_start then return nil end
+
   local is_range = comment.range and comment.range.start ~= comment.range.end_
+  local render_end = nil
+  if is_range then
+    render_end = get_render_lnum(bufnr, file, comment.range.end_)
+  end
 
   local extmark_opts = {
     virt_lines = {
@@ -281,7 +314,8 @@ local function render(bufnr, lnum, comment)
 
   if is_range then
     -- Range comment: single extmark at start with end_row at end
-    extmark_opts.end_row = comment.range.end_ - 1  -- 0-indexed
+    render_end = render_end or render_start
+    extmark_opts.end_row = render_end - 1  -- 0-indexed
     extmark_opts.end_col = 0
     extmark_opts.hl_group = 'NitRange'
     extmark_opts.hl_eol = true
@@ -292,7 +326,10 @@ local function render(bufnr, lnum, comment)
     extmark_opts.right_gravity = true
   end
 
-  local extmark_id = vim.api.nvim_buf_set_extmark(bufnr, ns, lnum - 1, 0, extmark_opts)
+  local extmark_id = vim.api.nvim_buf_set_extmark(bufnr, ns, render_start - 1, 0, extmark_opts)
+  if extmark_id then
+    comment.extmarks[bufnr] = extmark_id
+  end
 
   return extmark_id
 end
@@ -301,52 +338,110 @@ end
 local function restore_comments(bufnr)
   if not is_valid_buf(bufnr) then return end
 
-  local file = normalize_path(vim.api.nvim_buf_get_name(bufnr))
-  local comments = state.comments[file]
-  if not comments then return end
-
-  local line_count = vim.api.nvim_buf_line_count(bufnr)
-  local to_remove = {}
-
-  for lnum, comment in pairs(comments) do
-    if lnum > 0 and lnum <= line_count then
-      comment.extmark_id = render(bufnr, lnum, comment)
-    else
-      table.insert(to_remove, lnum)
+  local real_files = {}
+  local bufname = vim.api.nvim_buf_get_name(bufnr)
+  
+  if bufname:match("^codediff://") then
+    local path = bufname:match("^codediff://[^/]+/(.+)%?") or bufname:match("^codediff://[^/]+/(.+)$")
+    if path then
+      real_files[normalize_path(path)] = true
+    end
+  elseif vim.b[bufnr].snacks_meta then
+    for _, m in pairs(vim.b[bufnr].snacks_meta) do
+      if type(m) == 'table' and m.diff and m.diff.file then
+        real_files[normalize_path(m.diff.file)] = true
+      end
+    end
+  else
+    local file = normalize_path(bufname)
+    if file ~= '' then
+      real_files[file] = true
     end
   end
 
-  for _, lnum in ipairs(to_remove) do
-    comments[lnum] = nil
+  local line_count = vim.api.nvim_buf_line_count(bufnr)
+
+  for file in pairs(real_files) do
+    local comments = state.comments[file]
+    if comments then
+      local to_remove = {}
+
+      for lnum, comment in pairs(comments) do
+        local render_lnum = get_render_lnum(bufnr, file, lnum)
+        if render_lnum and render_lnum > 0 and render_lnum <= line_count then
+          render(bufnr, file, lnum, comment)
+        elseif not vim.b[bufnr].snacks_meta and not bufname:match("^codediff://") then
+          table.insert(to_remove, lnum)
+        end
+      end
+
+      for _, lnum in ipairs(to_remove) do
+        comments[lnum] = nil
+      end
+    end
   end
 end
 
 ---@param bufnr integer
----@return string file, integer lnum
-local function get_cursor_context(bufnr)
-  local file = normalize_path(vim.api.nvim_buf_get_name(bufnr))
-  local lnum = vim.api.nvim_win_get_cursor(0)[1]
-  return file, lnum
+---@param cursor_lnum? integer
+---@return string? file, integer? lnum
+function get_cursor_context(bufnr, cursor_lnum)
+  cursor_lnum = cursor_lnum or vim.api.nvim_win_get_cursor(0)[1]
+  local file = vim.api.nvim_buf_get_name(bufnr)
+  
+  if file:match("^codediff://") then
+    local path = file:match("^codediff://[^/]+/(.+)%?") or file:match("^codediff://[^/]+/(.+)$")
+    if path then
+      return normalize_path(path), cursor_lnum
+    end
+  end
+
+  if vim.b[bufnr].snacks_meta then
+    local meta = vim.b[bufnr].snacks_meta
+    -- Try to find the exact line
+    if type(meta[cursor_lnum]) == 'table' and meta[cursor_lnum].diff and meta[cursor_lnum].diff.file then
+      return normalize_path(meta[cursor_lnum].diff.file), meta[cursor_lnum].diff.line
+    end
+    -- Fallback: scan upwards
+    for l = cursor_lnum - 1, 1, -1 do
+      if type(meta[l]) == 'table' and meta[l].diff and meta[l].diff.file then
+        return normalize_path(meta[l].diff.file), meta[l].diff.line
+      end
+    end
+    -- Fallback: scan downwards
+    local line_count = vim.api.nvim_buf_line_count(bufnr)
+    for l = cursor_lnum + 1, line_count do
+      if type(meta[l]) == 'table' and meta[l].diff and meta[l].diff.file then
+        return normalize_path(meta[l].diff.file), meta[l].diff.line
+      end
+    end
+    return nil, nil
+  end
+
+  return normalize_path(file), cursor_lnum
 end
 
 ---@param file string
----@param use_extmarks? boolean
+---@param bufnr? integer
 ---@return {lnum: integer, comment: NitComment}[]
-local function get_sorted_comments(file, use_extmarks)
+local function get_sorted_comments(file, bufnr)
   local comments = state.comments[file]
   if not comments then return {} end
 
-  local bufnr = use_extmarks and get_bufnr_for_file(file) or nil
   local result = {}
 
   for stored_lnum, comment in pairs(comments) do
     local lnum = stored_lnum
 
-    if bufnr and comment.extmark_id then
-      local extmark_lnum = get_extmark_lnum(bufnr, comment.extmark_id)
+    if bufnr and comment.extmarks and comment.extmarks[bufnr] then
+      local extmark_lnum = get_extmark_lnum(bufnr, comment.extmarks[bufnr])
       if extmark_lnum then
         lnum = extmark_lnum
+      else
+        lnum = get_render_lnum(bufnr, file, stored_lnum) or stored_lnum
       end
+    elseif bufnr then
+      lnum = get_render_lnum(bufnr, file, stored_lnum) or stored_lnum
     end
 
     table.insert(result, { lnum = lnum, comment = comment })
@@ -368,8 +463,8 @@ local function collect_comments()
       local lnum = stored_lnum
       local range_end = nil
 
-      if bufnr and comment.extmark_id then
-        local start_lnum, end_lnum = get_extmark_range(bufnr, comment.extmark_id)
+      if bufnr and comment.extmarks and comment.extmarks[bufnr] then
+        local start_lnum, end_lnum = get_extmark_range(bufnr, comment.extmarks[bufnr])
         if start_lnum then
           lnum = start_lnum
           range_end = end_lnum
@@ -418,8 +513,8 @@ local function sync_extmark_positions(file)
   for stored_lnum, comment in pairs(comments) do
     local lnum = stored_lnum
 
-    if comment.extmark_id then
-      local start_lnum, end_lnum = get_extmark_range(bufnr, comment.extmark_id)
+    if comment.extmarks and comment.extmarks[bufnr] then
+      local start_lnum, end_lnum = get_extmark_range(bufnr, comment.extmarks[bufnr])
       if start_lnum then
         lnum = start_lnum
         -- Update range from extmark-tracked positions
@@ -457,8 +552,23 @@ end
 ---@param bufnr integer
 local function sync_buf_extmarks(bufnr)
   if not is_valid_buf(bufnr) then return end
-  local file = normalize_path(vim.api.nvim_buf_get_name(bufnr))
-  if file ~= '' then
+  local real_files = {}
+  local bufname = vim.api.nvim_buf_get_name(bufnr)
+  if bufname:match("^codediff://") then
+    local path = bufname:match("^codediff://[^/]+/(.+)%?") or bufname:match("^codediff://[^/]+/(.+)$")
+    if path then real_files[normalize_path(path)] = true end
+  elseif vim.b[bufnr].snacks_meta then
+    for _, m in pairs(vim.b[bufnr].snacks_meta) do
+      if type(m) == 'table' and m.diff and m.diff.file then
+        real_files[normalize_path(m.diff.file)] = true
+      end
+    end
+  else
+    local file = normalize_path(bufname)
+    if file ~= '' then real_files[file] = true end
+  end
+
+  for file in pairs(real_files) do
     sync_extmark_positions(file)
   end
 end
@@ -596,7 +706,7 @@ end
 -- Public API
 
 ---@param bufnr? integer
----@param lnum? integer 1-indexed start line (state key)
+---@param lnum? integer 1-indexed start line in buffer
 ---@param text string
 ---@param range? NitRange
 function M.add(bufnr, lnum, text, range)
@@ -606,9 +716,13 @@ function M.add(bufnr, lnum, text, range)
     return
   end
 
-  local file = normalize_path(vim.api.nvim_buf_get_name(bufnr))
-  if file == '' then
+  local file, real_lnum = get_cursor_context(bufnr, lnum)
+  if not file or file == '' then
     notify('Cannot add comment to unnamed buffer', vim.log.levels.WARN)
+    return
+  end
+  if not real_lnum then
+    notify('Could not resolve line number in buffer', vim.log.levels.WARN)
     return
   end
 
@@ -621,22 +735,33 @@ function M.add(bufnr, lnum, text, range)
   ---@type NitComment
   local comment = {
     text = text,
-    extmark_id = nil,
+    extmarks = {},
     range = range,
   }
 
-  local old = state.comments[file][lnum]
-  if old and old.extmark_id then
-    pcall(vim.api.nvim_buf_del_extmark, bufnr, ns, old.extmark_id)
+  local old = state.comments[file][real_lnum]
+  if old and old.extmarks then
+    for b, e in pairs(old.extmarks) do
+      pcall(vim.api.nvim_buf_del_extmark, b, ns, e)
+    end
   end
 
-  comment.extmark_id = render(bufnr, lnum, comment)
-  state.comments[file][lnum] = comment
+  state.comments[file][real_lnum] = comment
+  render(bufnr, file, real_lnum, comment)
+
+  for _, bufinfo in ipairs(vim.fn.getbufinfo({ bufloaded = 1 })) do
+    local b = bufinfo.bufnr
+    if b ~= bufnr then
+      restore_comments(b)
+    end
+  end
 end
 
 function M.delete()
   local bufnr = vim.api.nvim_get_current_buf()
   local file, cursor_lnum = get_cursor_context(bufnr)
+
+  if not file or file == '' then return end
 
   sync_extmark_positions(file)
 
@@ -647,8 +772,10 @@ function M.delete()
     return
   end
 
-  if comment.extmark_id then
-    pcall(vim.api.nvim_buf_del_extmark, bufnr, ns, comment.extmark_id)
+  if comment.extmarks then
+    for b, e in pairs(comment.extmarks) do
+      pcall(vim.api.nvim_buf_del_extmark, b, ns, e)
+    end
   end
 
   state.comments[file][found_lnum] = nil
@@ -658,7 +785,8 @@ end
 function M.next()
   local bufnr = vim.api.nvim_get_current_buf()
   local file, cursor = get_cursor_context(bufnr)
-  local sorted = get_sorted_comments(file, true)
+  if not file or file == '' then return end
+  local sorted = get_sorted_comments(file, bufnr)
 
   if #sorted == 0 then
     notify('No comments in buffer')
@@ -683,7 +811,8 @@ end
 function M.prev()
   local bufnr = vim.api.nvim_get_current_buf()
   local file, cursor = get_cursor_context(bufnr)
-  local sorted = get_sorted_comments(file, true)
+  if not file or file == '' then return end
+  local sorted = get_sorted_comments(file, bufnr)
 
   if #sorted == 0 then
     notify('No comments in buffer')
@@ -739,22 +868,40 @@ function M.input(opts)
     line1, line2 = line2, line1
   end
 
-  local is_range = line1 ~= line2
-  ---@type NitRange?
-  local range = is_range and { start = line1, end_ = line2 } or nil
+  local file1, real_line1 = get_cursor_context(target_buf, line1)
+  local file2, real_line2 = get_cursor_context(target_buf, line2)
 
-  -- The extmark/key line is the start of the range (or the single line)
-  local target_lnum = line1
+  if not file1 or file1 == '' then
+    notify('Cannot add comment to unnamed buffer', vim.log.levels.WARN)
+    return
+  end
+  if not real_line1 then
+    notify('Could not resolve real file context for start line', vim.log.levels.WARN)
+    return
+  end
+  if not real_line2 then
+    notify('Could not resolve real file context for end line', vim.log.levels.WARN)
+    return
+  end
+  if file1 ~= file2 then
+    notify('Selection spans multiple files', vim.log.levels.WARN)
+    return
+  end
+
+  local file = file1
+  -- Ensure real_line1 <= real_line2
+  if real_line1 > real_line2 then
+    real_line1, real_line2 = real_line2, real_line1
+  end
+
+  local is_range = real_line1 ~= real_line2
+  ---@type NitRange?
+  local range = is_range and { start = real_line1, end_ = real_line2 } or nil
 
   sync_extmark_positions(file)
 
-  -- Look for existing comment: first check exact match at target_lnum, then range membership
-  local existing_lnum, existing = find_comment_at(file, target_buf, target_lnum)
-
-  -- If no range was explicitly given (single-line invocation), also check if cursor is inside a range comment
-  if not existing and not is_range then
-    existing_lnum, existing = find_comment_at(file, target_buf, line1)
-  end
+  -- Look for existing comment
+  local existing_lnum, existing = find_comment_at(file, target_buf, line1)
 
   local prefill = ''
 
@@ -771,7 +918,7 @@ function M.input(opts)
 
   local title
   if is_range then
-    title = string.format(' [nit L%d-%d] ', line1, line2)
+    title = string.format(' [nit L%d-%d] ', real_line1, real_line2)
   else
     title = ' [nit] '
   end
@@ -825,8 +972,10 @@ function M.input(opts)
 
     if text == '' then
       if existing and existing_lnum then
-        if existing.extmark_id then
-          pcall(vim.api.nvim_buf_del_extmark, target_buf, ns, existing.extmark_id)
+        if existing.extmarks then
+          for b, e in pairs(existing.extmarks) do
+            pcall(vim.api.nvim_buf_del_extmark, b, ns, e)
+          end
         end
         state.comments[file][existing_lnum] = nil
         notify('Deleted comment')
@@ -835,13 +984,15 @@ function M.input(opts)
     end
 
     if existing and existing_lnum then
-      if existing.extmark_id then
-        pcall(vim.api.nvim_buf_del_extmark, target_buf, ns, existing.extmark_id)
+      if existing.extmarks then
+        for b, e in pairs(existing.extmarks) do
+          pcall(vim.api.nvim_buf_del_extmark, b, ns, e)
+        end
       end
       state.comments[file][existing_lnum] = nil
     end
 
-    M.add(target_buf, target_lnum, text, range)
+    M.add(target_buf, line1, text, range)
     notify(existing and 'Updated comment' or 'Added comment')
   end
 
@@ -1082,7 +1233,29 @@ function M.setup(opts)
   vim.api.nvim_create_autocmd('BufWinEnter', {
     group = augroup,
     callback = function(ev)
-      restore_comments(ev.buf)
+      if is_valid_buf(ev.buf) then
+        restore_comments(ev.buf)
+      end
+      -- Fallback for dynamic buffers (snacks diff, codediff)
+      vim.defer_fn(function()
+        if vim.api.nvim_buf_is_valid(ev.buf) and is_valid_buf(ev.buf) then
+          restore_comments(ev.buf)
+        end
+      end, 100)
+    end,
+  })
+
+  -- Explicit hooks for codediff
+  vim.api.nvim_create_autocmd('User', {
+    pattern = { 'CodeDiffOpen', 'CodeDiffFileSelect' },
+    group = augroup,
+    callback = function()
+      vim.defer_fn(function()
+        local bufnr = vim.api.nvim_get_current_buf()
+        if is_valid_buf(bufnr) then
+          restore_comments(bufnr)
+        end
+      end, 50)
     end,
   })
 
