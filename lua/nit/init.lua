@@ -53,8 +53,10 @@ local function is_valid_buf(bufnr)
   if not bufnr or not vim.api.nvim_buf_is_valid(bufnr) then
     return false
   end
-  local bt = vim.bo[bufnr].buftype
+  local bufname = vim.api.nvim_buf_get_name(bufnr)
+  if bufname:match("^codediff://") then return true end
   if vim.b[bufnr].snacks_meta then return true end
+  local bt = vim.bo[bufnr].buftype
   return bt == '' or bt == 'acwrite'
 end
 
