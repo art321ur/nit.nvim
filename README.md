@@ -1,7 +1,7 @@
 # nit.nvim
 
 A Neovim plugin for leaving review comments in code and exporting them as structured feedback for AI agents.
-
+test edit
 - Comments rendered as virtual text with `[nit]` prefix
 - Range comments via visual selection with highlighted line ranges
 - Comments follow line movements automatically via extmarks
