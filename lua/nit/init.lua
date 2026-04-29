@@ -33,6 +33,14 @@ local state = {
   initialized = false,
 }
 
+local codediff_session = {
+  tabpage = nil,
+  orig_buf = nil,
+  mod_buf = nil,
+  orig_path = nil,
+  mod_path = nil,
+}
+
 ---@type NitOpts
 local config = {
   picker = 'auto',
@@ -46,6 +54,28 @@ local config = {
 local HL = 'DiagnosticHint'
 
 -- Utilities
+
+local function update_codediff_session()
+  local ok, lifecycle = pcall(require, 'codediff.ui.lifecycle')
+  if not ok then return end
+  local tabpage = vim.api.nvim_get_current_tabpage()
+  local sess = lifecycle.get_session(tabpage)
+  if not sess then
+    codediff_session.tabpage = nil
+    codediff_session.orig_buf = nil
+    codediff_session.mod_buf = nil
+    codediff_session.orig_path = nil
+    codediff_session.mod_path = nil
+    return
+  end
+  local orig_buf, mod_buf = lifecycle.get_buffers(tabpage)
+  local orig_path, mod_path = lifecycle.get_paths(tabpage)
+  codediff_session.tabpage = tabpage
+  codediff_session.orig_buf = orig_buf
+  codediff_session.mod_buf = mod_buf
+  codediff_session.orig_path = orig_path
+  codediff_session.mod_path = mod_path
+end
 
 ---@param bufnr integer
 ---@return boolean
@@ -344,7 +374,12 @@ local function restore_comments(bufnr)
   local bufname = vim.api.nvim_buf_get_name(bufnr)
   
   if bufname:match("^codediff://") then
-    local path = bufname:match("^codediff://[^/]+/(.+)%?") or bufname:match("^codediff://[^/]+/(.+)$")
+    local path
+    if codediff_session.orig_buf and bufnr == codediff_session.orig_buf then
+      path = codediff_session.orig_path
+    elseif codediff_session.mod_buf and bufnr == codediff_session.mod_buf then
+      path = codediff_session.mod_path
+    end
     if path then
       real_files[normalize_path(path)] = true
     end
@@ -392,10 +427,21 @@ function get_cursor_context(bufnr, cursor_lnum)
   local file = vim.api.nvim_buf_get_name(bufnr)
   
   if file:match("^codediff://") then
-    local path = file:match("^codediff://[^/]+/(.+)%?") or file:match("^codediff://[^/]+/(.+)$")
+    if not codediff_session.orig_path and not codediff_session.mod_path then
+      update_codediff_session()
+    end
+    local path
+    if codediff_session.orig_buf and bufnr == codediff_session.orig_buf then
+      path = codediff_session.orig_path
+    elseif codediff_session.mod_buf and bufnr == codediff_session.mod_buf then
+      path = codediff_session.mod_path
+    else
+      path = codediff_session.mod_path or codediff_session.orig_path
+    end
     if path then
       return normalize_path(path), cursor_lnum
     end
+    return nil, nil
   end
 
   if vim.b[bufnr].snacks_meta then
@@ -1253,11 +1299,20 @@ function M.setup(opts)
     group = augroup,
     callback = function()
       vim.defer_fn(function()
-        local bufnr = vim.api.nvim_get_current_buf()
-        if is_valid_buf(bufnr) then
-          restore_comments(bufnr)
+        update_codediff_session()
+        for _, b in ipairs({ codediff_session.orig_buf, codediff_session.mod_buf }) do
+          if b and vim.api.nvim_buf_is_valid(b) then
+            restore_comments(b)
+          end
         end
-      end, 50)
+      end, 100)
+    end,
+  })
+
+  vim.api.nvim_create_autocmd('TabEnter', {
+    group = augroup,
+    callback = function()
+      vim.defer_fn(update_codediff_session, 100)
     end,
   })
 
