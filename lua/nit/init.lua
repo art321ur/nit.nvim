@@ -57,10 +57,37 @@ local HL = 'DiagnosticHint'
 
 -- Utilities
 
-local function update_codediff_session()
+---Codediff returns either a plain string (older versions) or a Path ref
+---table with `absolute`/`relative` fields (newer versions).
+---@param p any
+---@param root? string
+---@return string?
+local function codediff_path_str(p, root)
+  if type(p) == 'string' then
+    return p ~= '' and p or nil
+  end
+  if type(p) ~= 'table' then return nil end
+  if type(p.absolute) == 'string' and p.absolute ~= '' then
+    return p.absolute
+  end
+  if type(p.relative) == 'string' and p.relative ~= '' then
+    if type(root) == 'string' and root ~= '' then
+      return root .. '/' .. p.relative
+    end
+    return p.relative
+  end
+  return nil
+end
+
+---@param bufnr? integer resolve the session owning this buffer, else current tab
+local function update_codediff_session(bufnr)
   local ok, lifecycle = pcall(require, 'codediff.ui.lifecycle')
   if not ok then return end
-  local tabpage = vim.api.nvim_get_current_tabpage()
+  local tabpage
+  if bufnr and lifecycle.find_tabpage_by_buffer then
+    tabpage = lifecycle.find_tabpage_by_buffer(bufnr)
+  end
+  tabpage = tabpage or vim.api.nvim_get_current_tabpage()
   local sess = lifecycle.get_session(tabpage)
   if not sess then
     codediff_session.tabpage = nil
@@ -72,11 +99,25 @@ local function update_codediff_session()
   end
   local orig_buf, mod_buf = lifecycle.get_buffers(tabpage)
   local orig_path, mod_path = lifecycle.get_paths(tabpage)
+  local root = sess.git_root
   codediff_session.tabpage = tabpage
   codediff_session.orig_buf = orig_buf
   codediff_session.mod_buf = mod_buf
-  codediff_session.orig_path = orig_path
-  codediff_session.mod_path = mod_path
+  codediff_session.orig_path = codediff_path_str(orig_path, root)
+  codediff_session.mod_path = codediff_path_str(mod_path, root)
+end
+
+---@param bufnr integer
+---@return string? path real file behind a codediff:// buffer
+local function codediff_path_for_buf(bufnr)
+  update_codediff_session(bufnr)
+  if codediff_session.orig_buf and bufnr == codediff_session.orig_buf then
+    return codediff_session.orig_path
+  end
+  if codediff_session.mod_buf and bufnr == codediff_session.mod_buf then
+    return codediff_session.mod_path
+  end
+  return nil
 end
 
 ---@param bufnr integer
@@ -95,7 +136,7 @@ end
 ---@param file string
 ---@return string
 local function normalize_path(file)
-  if file == '' then return '' end
+  if type(file) ~= 'string' or file == '' then return '' end
   local absolute = vim.fn.fnamemodify(file, ':p')
 
   -- Try to resolve symlinks
@@ -376,12 +417,7 @@ local function restore_comments(bufnr)
   local bufname = vim.api.nvim_buf_get_name(bufnr)
   
   if bufname:match("^codediff://") then
-    local path
-    if codediff_session.orig_buf and bufnr == codediff_session.orig_buf then
-      path = codediff_session.orig_path
-    elseif codediff_session.mod_buf and bufnr == codediff_session.mod_buf then
-      path = codediff_session.mod_path
-    end
+    local path = codediff_path_for_buf(bufnr)
     if path then
       real_files[normalize_path(path)] = true
     end
@@ -429,17 +465,9 @@ function get_cursor_context(bufnr, cursor_lnum)
   local file = vim.api.nvim_buf_get_name(bufnr)
   
   if file:match("^codediff://") then
-    if not codediff_session.orig_path and not codediff_session.mod_path then
-      update_codediff_session()
-    end
-    local path
-    if codediff_session.orig_buf and bufnr == codediff_session.orig_buf then
-      path = codediff_session.orig_path
-    elseif codediff_session.mod_buf and bufnr == codediff_session.mod_buf then
-      path = codediff_session.mod_path
-    else
-      path = codediff_session.mod_path or codediff_session.orig_path
-    end
+    local path = codediff_path_for_buf(bufnr)
+      or codediff_session.mod_path
+      or codediff_session.orig_path
     if path then
       return normalize_path(path), cursor_lnum
     end
@@ -1746,7 +1774,7 @@ function M.setup(opts)
   vim.api.nvim_create_autocmd('TabEnter', {
     group = augroup,
     callback = function()
-      vim.defer_fn(update_codediff_session, 100)
+      vim.defer_fn(function() update_codediff_session() end, 100)
     end,
   })
 
