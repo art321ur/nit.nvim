@@ -44,6 +44,22 @@ function M.check()
 
   vim.health.info('Quickfix picker always available (built-in)')
 
+  -- Check gh CLI (required for :NitPr)
+  if vim.fn.executable('gh') == 1 then
+    local out = vim.fn.system({ 'gh', 'auth', 'status' })
+    if vim.v.shell_error == 0 then
+      vim.health.ok('gh CLI: installed and authenticated')
+    else
+      vim.health.warn('gh CLI installed but not authenticated', {
+        'Run: gh auth login',
+        'Required for :NitPr',
+        tostring(out),
+      })
+    end
+  else
+    vim.health.info('gh CLI not installed (only required for :NitPr)')
+  end
+
   -- Check if initialized
   local ok, nit = pcall(require, 'nit')
   if ok then

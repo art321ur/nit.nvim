@@ -8,6 +8,7 @@ A Neovim plugin for leaving review comments in code and exporting them as struct
 - Export all comments as LLM-optimized markdown in one shot
 - Export uses live buffer content (not stale snapshots from comment time)
 - Navigate between comments with `:NitNext` / `:NitPrev`
+- Import unresolved PR review comments via `gh` CLI (`:NitPr`)
 - Works with Snacks, Telescope, or quickfix pickers
 
 ## Getting Started
@@ -39,6 +40,24 @@ A Neovim plugin for leaving review comments in code and exporting them as struct
   },
 }
 ```
+
+## Importing PR Comments
+
+`:NitPr` pulls unresolved GitHub PR review comments into your local nit list via the [`gh` CLI](https://cli.github.com). Each review thread (top-level comment + replies) collapses into one nit. PR-level comments are bundled into a single nit at the first changed file.
+
+```vim
+:NitPr                                            " auto-detect PR for branch
+:NitPr https://github.com/owner/repo/pull/42      " explicit URL
+```
+
+Notes:
+
+- Requires `gh` installed and authenticated (`gh auth login`).
+- Works on forks: PR is fetched from the parent (`baseRepository`) automatically.
+- Resolved threads and outdated comments (no current line) are skipped.
+- Re-running clears previously imported nits and refreshes; local hand-written nits are preserved.
+
+Recommended workflow: `gh pr checkout <num>` first so line numbers match. Then `:NitPr` → review/edit imported nits → address with your AI agent → `:NitExport`.
 
 ## Comment Input
 

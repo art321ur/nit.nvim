@@ -43,7 +43,7 @@ Using lazy.nvim: >lua
         require('nit').setup()
       end,
       cmd = { 'NitAdd', 'NitDelete', 'NitList', 'NitExport',
-              'NitClear', 'NitNext', 'NitPrev' },
+              'NitClear', 'NitNext', 'NitPrev', 'NitPr' },
       keys = {
         { '<leader>na', function() require('nit').input() end,
           desc = '[nit] Add/edit' },
@@ -108,6 +108,41 @@ COMMANDS                                                        *nit-commands*
 :NitPrev                                                           *:NitPrev*
     Navigate to the previous comment in the current file. Wraps to the last
     comment if at the beginning.
+
+:NitPr [{url}]                                                       *:NitPr*
+    Import unresolved review comments and PR-level comments from a GitHub
+    pull request as nits, using the `gh` CLI.
+
+    Each unresolved review thread is collapsed into a single nit (all
+    replies joined as `@author: body` blocks). PR-level (issue) comments
+    are combined into one extra nit anchored at line 1 of the first
+    changed file with the header `[PR general comments]`.
+
+    With no argument, the PR is auto-detected via `gh pr view` for the
+    current branch. For forks, the PR is fetched from the parent
+    (`baseRepository`) repo automatically.
+
+    With a URL argument, parses
+    `https://github.com/<owner>/<repo>/pull/<number>` directly. Useful
+    when the current branch has no associated PR or when reviewing a
+    PR from a different checkout.
+
+    Skipped silently:
+      • Resolved threads (`isResolved == true`)
+      • Outdated comments with no current line anchor (counted in summary)
+      • Threads whose file does not exist locally (counted in summary)
+
+    Re-running clears all previously imported nits (those tagged with
+    `source = 'pr'` in state) and re-imports fresh. Local hand-written
+    nits are untouched.
+
+    Requires the `gh` CLI installed and authenticated. See
+    https://cli.github.com.
+
+    Examples: >vim
+        :NitPr
+        :NitPr https://github.com/owner/repo/pull/42
+<
 
 ==============================================================================
 API                                                                  *nit-api*
@@ -188,6 +223,18 @@ require('nit').next()                                             *nit.next()*
 
 require('nit').prev()                                             *nit.prev()*
     Navigate to the previous comment. This is the same as |:NitPrev|.
+
+require('nit').pr({url})                                             *nit.pr()*
+    Import unresolved PR comments. Same as |:NitPr|.
+
+    Parameters: ~
+        {url} (string|nil) Optional PR URL. If nil, auto-detects from
+                           current branch via `gh pr view`.
+
+    Example: >lua
+        require('nit').pr()
+        require('nit').pr('https://github.com/owner/repo/pull/42')
+<
 
 require('nit').count()                                           *nit.count()*
     Get total number of comments across all files.

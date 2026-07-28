@@ -60,6 +60,7 @@ nit.nvim/
 - `:NitExport` - Copy to clipboard
 - `:NitClear` - Clear all (with confirmation)
 - `:NitNext` / `:NitPrev` - Navigate
+- `:NitPr [url]` - Import unresolved PR comments via `gh` CLI (collapses each thread into one nit; tags imports with `source='pr'` so re-running clears them first)
 
 Note: Keymaps are user-configured. See README.md for recommended setup.
 

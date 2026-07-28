@@ -4,6 +4,7 @@
 :NitExport	nit.txt	/*:NitExport*
 :NitList	nit.txt	/*:NitList*
 :NitNext	nit.txt	/*:NitNext*
+:NitPr	nit.txt	/*:NitPr*
 :NitPrev	nit.txt	/*:NitPrev*
 nit-api	nit.txt	/*nit-api*
 nit-commands	nit.txt	/*nit-commands*
@@ -22,6 +23,7 @@ nit.get_comments()	nit.txt	/*nit.get_comments()*
 nit.input()	nit.txt	/*nit.input()*
 nit.list()	nit.txt	/*nit.list()*
 nit.next()	nit.txt	/*nit.next()*
+nit.pr()	nit.txt	/*nit.pr()*
 nit.prev()	nit.txt	/*nit.prev()*
 nit.setup()	nit.txt	/*nit.setup()*
 nit.txt	nit.txt	/*nit.txt*

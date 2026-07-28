@@ -8,6 +8,8 @@
 ---@field text string
 ---@field extmarks table<integer, integer>
 ---@field range? NitRange
+---@field source? string Source tag ('pr' for imported PR comments)
+---@field thread_id? string GitHub review thread node id (for PR imports)
 
 ---@class NitState
 ---@field comments table<string, table<integer, NitComment>>
@@ -751,6 +753,254 @@ local function list_quickfix(items)
   vim.cmd('copen')
 end
 
+-- PR import (gh CLI)
+
+local GRAPHQL_PR_QUERY = [[
+query($owner:String!,$repo:String!,$number:Int!){
+  repository(owner:$owner,name:$repo){
+    pullRequest(number:$number){
+      reviewThreads(first:100){
+        nodes{
+          id
+          isResolved
+          isOutdated
+          comments(first:50){
+            nodes{ author{login} body path line startLine originalLine }
+          }
+        }
+      }
+      comments(first:100){
+        nodes{ author{login} body }
+      }
+    }
+  }
+}
+]]
+
+---@param cmd string[]
+---@return boolean ok, string stdout, string stderr
+local function run_cmd(cmd)
+  local result = vim.system(cmd, { text = true }):wait()
+  return result.code == 0, result.stdout or '', result.stderr or ''
+end
+
+---@param json string
+---@return any?
+local function json_decode(json)
+  local ok, decoded = pcall(vim.json.decode, json, { luanil = { object = true, array = true } })
+  if not ok then return nil end
+  return decoded
+end
+
+---@return string? root absolute path to git toplevel
+local function git_root()
+  local ok, stdout = run_cmd({ 'git', 'rev-parse', '--show-toplevel' })
+  if not ok then return nil end
+  local trimmed = vim.trim(stdout)
+  if trimmed == '' then return nil end
+  return trimmed
+end
+
+---@param url string
+---@return {owner:string, repo:string, number:integer}?
+local function parse_pr_url(url)
+  local owner, repo, num = url:match('github%.com/([^/]+)/([^/]+)/pull/(%d+)')
+  if owner and repo and num then
+    return { owner = owner, repo = repo, number = tonumber(num) }
+  end
+  return nil
+end
+
+---Detect PR for current branch via `gh pr view`, or parse URL if given.
+---`gh pr view` resolves to the upstream PR even from a fork checkout,
+---and the returned `url` field contains owner/repo/number directly.
+---@param url? string
+---@return {owner:string, repo:string, number:integer}?
+local function detect_pr(url)
+  if url then
+    local parsed = parse_pr_url(url)
+    if parsed then return parsed end
+    notify('Invalid PR URL: ' .. url, vim.log.levels.ERROR)
+    return nil
+  end
+
+  local ok, stdout, stderr = run_cmd({ 'gh', 'pr', 'view', '--json', 'url' })
+  if not ok then
+    local hint = vim.trim(stderr) ~= '' and ('\n' .. vim.trim(stderr)) or ''
+    notify('No PR detected for current branch. Pass URL: :NitPr <url>' .. hint, vim.log.levels.ERROR)
+    return nil
+  end
+
+  local decoded = json_decode(stdout)
+  if not decoded or not decoded.url then
+    notify('Failed to parse gh pr view output', vim.log.levels.ERROR)
+    return nil
+  end
+
+  local parsed = parse_pr_url(decoded.url)
+  if not parsed then
+    notify('Could not parse PR URL from gh: ' .. decoded.url, vim.log.levels.ERROR)
+    return nil
+  end
+  return parsed
+end
+
+---@param owner string
+---@param repo string
+---@param number integer
+---@return {threads:table[], general:table[]}?
+local function fetch_pr(owner, repo, number)
+  local ok, stdout, stderr = run_cmd({
+    'gh', 'api', 'graphql',
+    '-F', 'owner=' .. owner,
+    '-F', 'repo=' .. repo,
+    '-F', 'number=' .. number,
+    '-f', 'query=' .. GRAPHQL_PR_QUERY,
+  })
+  if not ok then
+    notify('gh api graphql failed:\n' .. vim.trim(stderr), vim.log.levels.ERROR)
+    return nil
+  end
+
+  local decoded = json_decode(stdout)
+  if not decoded or not decoded.data or not decoded.data.repository
+     or not decoded.data.repository.pullRequest then
+    notify('Failed to parse PR data from gh', vim.log.levels.ERROR)
+    return nil
+  end
+
+  local pr = decoded.data.repository.pullRequest
+  local threads = (pr.reviewThreads and pr.reviewThreads.nodes) or {}
+  local general = (pr.comments and pr.comments.nodes) or {}
+  return { threads = threads, general = general }
+end
+
+---Pick the last comment in a thread that has a non-nil line anchor.
+---@param comments table[]
+---@return table?
+local function pick_anchor_comment(comments)
+  if not comments or #comments == 0 then return nil end
+  for i = #comments, 1, -1 do
+    if comments[i].line then return comments[i] end
+  end
+  return comments[#comments]
+end
+
+---@param comments table[]
+---@return string
+local function format_thread_body(comments)
+  local parts = {}
+  for _, c in ipairs(comments) do
+    local author = (c.author and c.author.login) or 'unknown'
+    table.insert(parts, string.format('@%s: %s', author, c.body or ''))
+  end
+  return table.concat(parts, '\n\n')
+end
+
+---@param comments table[]
+---@return string
+local function format_general_body(comments)
+  local lines = { '[PR general comments]', '' }
+  for i, c in ipairs(comments) do
+    local author = (c.author and c.author.login) or 'unknown'
+    table.insert(lines, string.format('@%s: %s', author, c.body or ''))
+    if i < #comments then
+      table.insert(lines, '')
+    end
+  end
+  return table.concat(lines, '\n')
+end
+
+---Find the first changed file path that exists locally. Tries thread paths
+---first, falls back to `gh pr diff --name-only`.
+---@param threads table[]
+---@param owner string
+---@param repo string
+---@param number integer
+---@param root string
+---@return string?
+local function first_changed_file(threads, owner, repo, number, root)
+  for _, thread in ipairs(threads) do
+    local nodes = (thread.comments and thread.comments.nodes) or {}
+    if nodes[1] and nodes[1].path then
+      local abs = normalize_path(root .. '/' .. nodes[1].path)
+      if file_exists(abs) then return abs end
+    end
+  end
+  local ok, stdout = run_cmd({
+    'gh', 'pr', 'diff', '--name-only',
+    '--repo', owner .. '/' .. repo,
+    tostring(number),
+  })
+  if ok and stdout then
+    for line in stdout:gmatch('[^\n]+') do
+      local abs = normalize_path(root .. '/' .. line)
+      if file_exists(abs) then return abs end
+    end
+  end
+  return nil
+end
+
+---Remove all PR-imported nits (source == 'pr') from state and clear extmarks.
+---@return integer count number cleared
+local function clear_imported()
+  local count = 0
+  for _, comments in pairs(state.comments) do
+    local to_remove = {}
+    for lnum, comment in pairs(comments) do
+      if comment.source == 'pr' then
+        if comment.extmarks then
+          for b, e in pairs(comment.extmarks) do
+            pcall(vim.api.nvim_buf_del_extmark, b, ns, e)
+          end
+        end
+        table.insert(to_remove, lnum)
+        count = count + 1
+      end
+    end
+    for _, lnum in ipairs(to_remove) do
+      comments[lnum] = nil
+    end
+  end
+  return count
+end
+
+---Write a comment to state without rendering. Caller invokes
+---refresh_loaded_buffers() once after batch.
+---@param file string normalized absolute path
+---@param lnum integer 1-indexed
+---@param text string
+---@param range? NitRange
+---@param opts? { source?: string, thread_id?: string }
+local function add_for_file(file, lnum, text, range, opts)
+  opts = opts or {}
+  state.comments[file] = state.comments[file] or {}
+
+  local old = state.comments[file][lnum]
+  if old and old.extmarks then
+    for b, e in pairs(old.extmarks) do
+      pcall(vim.api.nvim_buf_del_extmark, b, ns, e)
+    end
+  end
+
+  state.comments[file][lnum] = {
+    text = text,
+    extmarks = {},
+    range = range,
+    source = opts.source,
+    thread_id = opts.thread_id,
+  }
+end
+
+---Re-render all comments in every loaded valid buffer.
+local function refresh_loaded_buffers()
+  for _, bufinfo in ipairs(vim.fn.getbufinfo({ bufloaded = 1 })) do
+    if is_valid_buf(bufinfo.bufnr) then
+      restore_comments(bufinfo.bufnr)
+    end
+  end
+end
+
 -- Public API
 
 ---@param bufnr? integer
@@ -880,6 +1130,105 @@ function M.prev()
   if config.notify_wrap then
     notify('Wrapped to last comment')
   end
+end
+
+---@return string[] sorted list of files with at least one comment
+local function get_files_with_comments()
+  local files = {}
+  for f, comments in pairs(state.comments) do
+    if next(comments) then
+      table.insert(files, f)
+    end
+  end
+  table.sort(files)
+  return files
+end
+
+---@param dir 'next'|'prev'
+local function nav_global(dir)
+  local bufnr = vim.api.nvim_get_current_buf()
+  local file, cursor = get_cursor_context(bufnr)
+
+  -- Try in-buffer first (no wrap)
+  if file and file ~= '' then
+    local sorted = get_sorted_comments(file, bufnr)
+    if dir == 'next' then
+      for _, item in ipairs(sorted) do
+        if item.lnum > cursor then
+          vim.api.nvim_win_set_cursor(0, { item.lnum, 0 })
+          vim.cmd('normal! zz')
+          return
+        end
+      end
+    else
+      for i = #sorted, 1, -1 do
+        if sorted[i].lnum < cursor then
+          vim.api.nvim_win_set_cursor(0, { sorted[i].lnum, 0 })
+          vim.cmd('normal! zz')
+          return
+        end
+      end
+    end
+  end
+
+  -- Jump to next/prev file
+  local files = get_files_with_comments()
+  if #files == 0 then
+    notify('No comments')
+    return
+  end
+
+  local cur_idx
+  for i, f in ipairs(files) do
+    if f == file then cur_idx = i; break end
+  end
+
+  local next_idx
+  if cur_idx then
+    if #files == 1 then
+      -- Only one file with comments; wrap within current file
+      local sorted = get_sorted_comments(file, bufnr)
+      if #sorted == 0 then return end
+      local target = dir == 'next' and sorted[1] or sorted[#sorted]
+      vim.api.nvim_win_set_cursor(0, { target.lnum, 0 })
+      vim.cmd('normal! zz')
+      if config.notify_wrap then
+        notify(dir == 'next' and 'Wrapped to first comment' or 'Wrapped to last comment')
+      end
+      return
+    end
+    if dir == 'next' then
+      next_idx = (cur_idx % #files) + 1
+    else
+      next_idx = ((cur_idx - 2) % #files) + 1
+    end
+  else
+    next_idx = dir == 'next' and 1 or #files
+  end
+
+  local target_file = files[next_idx]
+  if not file_exists(target_file) then
+    notify('File no longer exists: ' .. target_file, vim.log.levels.WARN)
+    return
+  end
+
+  vim.cmd('edit ' .. vim.fn.fnameescape(target_file))
+  vim.schedule(function()
+    local new_bufnr = vim.api.nvim_get_current_buf()
+    local sorted = get_sorted_comments(target_file, new_bufnr)
+    if #sorted == 0 then return end
+    local target = dir == 'next' and sorted[1] or sorted[#sorted]
+    vim.api.nvim_win_set_cursor(0, { target.lnum, 0 })
+    vim.cmd('normal! zz')
+  end)
+end
+
+function M.next_global()
+  nav_global('next')
+end
+
+function M.prev_global()
+  nav_global('prev')
 end
 
 ---@param opts? {line1?: integer, line2?: integer}
@@ -1185,6 +1534,91 @@ function M.export()
   end
 end
 
+---Import unresolved PR comments as nits via `gh` CLI.
+---Each unresolved review thread becomes one nit (all replies collapsed).
+---PR-level (issue) comments are combined into a single nit anchored at
+---line 1 of the first changed file. Outdated comments (no current line)
+---are skipped. Re-running clears previously imported nits first.
+---@param url? string PR URL; if omitted, auto-detects from current branch
+function M.pr(url)
+  if vim.fn.executable('gh') == 0 then
+    notify('gh CLI not installed. See https://cli.github.com', vim.log.levels.ERROR)
+    return
+  end
+
+  notify('Fetching PR comments...')
+
+  local pr = detect_pr(url)
+  if not pr then return end
+
+  local data = fetch_pr(pr.owner, pr.repo, pr.number)
+  if not data then return end
+
+  local root = git_root()
+  if not root then
+    notify('Not in a git repository', vim.log.levels.ERROR)
+    return
+  end
+
+  local cleared = clear_imported()
+
+  local imported = 0
+  local outdated = 0
+  local missing = 0
+
+  for _, thread in ipairs(data.threads) do
+    if not thread.isResolved then
+      local nodes = (thread.comments and thread.comments.nodes) or {}
+      local anchor = pick_anchor_comment(nodes)
+      if anchor then
+        if not anchor.line then
+          outdated = outdated + 1
+        else
+          local file_abs = normalize_path(root .. '/' .. anchor.path)
+          if not file_exists(file_abs) then
+            missing = missing + 1
+          else
+            local body = format_thread_body(nodes)
+            local range = nil
+            if anchor.startLine and anchor.startLine ~= anchor.line then
+              local start_l = math.min(anchor.startLine, anchor.line)
+              local end_l = math.max(anchor.startLine, anchor.line)
+              range = { start = start_l, end_ = end_l }
+            end
+            add_for_file(file_abs, anchor.line, body, range, {
+              source = 'pr',
+              thread_id = thread.id,
+            })
+            imported = imported + 1
+          end
+        end
+      end
+    end
+  end
+
+  local general_count = 0
+  if #data.general > 0 then
+    local anchor_file = first_changed_file(data.threads, pr.owner, pr.repo, pr.number, root)
+    if anchor_file then
+      local body = format_general_body(data.general)
+      add_for_file(anchor_file, 1, body, nil, {
+        source = 'pr',
+        thread_id = 'pr-general',
+      })
+      general_count = #data.general
+    else
+      notify('No anchor file found for PR general comments; skipped', vim.log.levels.WARN)
+    end
+  end
+
+  refresh_loaded_buffers()
+
+  notify(string.format(
+    'PR #%d: imported %d threads, %d general (%d outdated, %d missing skipped). Cleared %d previous.',
+    pr.number, imported, general_count, outdated, missing, cleared
+  ))
+end
+
 function M.clear()
   local total = M.count()
 
@@ -1345,11 +1779,19 @@ function M.setup(opts)
     NitClear = { fn = M.clear, desc = 'Clear all comments' },
     NitNext = { fn = M.next, desc = 'Go to next comment' },
     NitPrev = { fn = M.prev, desc = 'Go to previous comment' },
+    NitNextGlobal = { fn = M.next_global, desc = 'Go to next comment (cross-file)' },
+    NitPrevGlobal = { fn = M.prev_global, desc = 'Go to previous comment (cross-file)' },
   }
 
   for name, cmd in pairs(commands) do
     vim.api.nvim_create_user_command(name, cmd.fn, { desc = cmd.desc })
   end
+
+  -- NitPr accepts an optional URL argument
+  vim.api.nvim_create_user_command('NitPr', function(cmd_opts)
+    local arg = cmd_opts.args ~= '' and cmd_opts.args or nil
+    M.pr(arg)
+  end, { nargs = '?', desc = 'Import unresolved PR comments as nits' })
 
   -- NitAdd supports range for visual selection and command ranges
   vim.api.nvim_create_user_command('NitAdd', function(cmd_opts)
